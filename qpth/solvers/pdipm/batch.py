@@ -5,18 +5,26 @@ from enum import Enum
 from qpth.util import get_sizes, bdiag
 
 
-def lu_hack(x):
-    data, pivots = torch.linalg.lu_factor(x, pivot=not x.is_cuda)
+# Diagonal regularization added before every LU factorization. The interior-point KKT blocks can be
+# (near-)singular -- e.g. a QP padded with all-zero constraint rows makes the equality normal
+# equations A Q^-1 A^T rank-deficient -- and the previous non-pivoted CUDA path then divided by zero.
+# A tiny diagonal makes the factorization well-posed (trivial duals -> ~0; the primal is unchanged).
+KKT_REG = 1e-10
 
-    if x.is_cuda:
-        if x.ndimension() == 2:
-            pivots = torch.arange(1, 1+x.size(0)).int().to(x.device)
-        elif x.ndimension() == 3:
-            pivots = torch.arange(
-                1, 1+x.size(1),
-            ).unsqueeze(0).repeat(x.size(0), 1).int().to(x.device)
-        else:
-            assert False
+
+def set_kkt_reg(reg):
+    """Set the diagonal regularization added before each KKT LU factorization (default 1e-10)."""
+    global KKT_REG
+    KKT_REG = reg
+
+
+def lu_hack(x):
+    """Batched LU factorization with diagonal regularization and pivoting. Modern torch does pivoted
+    batched LU efficiently on CUDA (cuSOLVER), and lu_factor_ex does not throw on singular inputs."""
+    if KKT_REG > 0 and x.dim() >= 2 and x.shape[-1] == x.shape[-2]:
+        x = x.clone()
+        x.diagonal(dim1=-2, dim2=-1).add_(KKT_REG)
+    data, pivots, _ = torch.linalg.lu_factor_ex(x, pivot=True)
     return (data, pivots)
 
 

@@ -8,10 +8,14 @@ setup(
     author_email='bamos@cs.cmu.edu',
     platforms=['any'],
     license="Apache 2.0",
-    url='https://github.com/locuslab/qpth',
+    url='https://github.com/CoMMALab/qpth',
     packages=find_packages(),
+    python_requires='>=3.9',
     install_requires=[
-        'numpy>=1,<2',
-        'cvxpy>=1.1.0'
-    ]
+        'numpy',
+        'torch>=2.0',
+    ],
+    extras_require={
+        'cvxpy': ['cvxpy>=1.1.0'],   # only for the optional QPSolvers.CVXPY backend
+    },
 )
