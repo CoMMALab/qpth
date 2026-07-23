@@ -11,6 +11,12 @@ from qpth.util import get_sizes, bdiag
 # A tiny diagonal makes the factorization well-posed (trivial duals -> ~0; the primal is unchanged).
 KKT_REG = 1e-10
 
+# Signed static regularization for the DENSE KKT solver (LU_DENSE). Clarabel-style: +reg on the
+# primal/slack blocks, -reg on the dual blocks, keeping the KKT symmetric-quasidefinite and
+# nonsingular even when G/A are (near-)degenerate. reg magnitude is not sensitive (1e-10..1e-7 give
+# the same answer on the dvsim contact QPs); it just guarantees a factorization exists.
+DENSE_REG = 1e-8
+
 
 def set_kkt_reg(reg):
     """Set the diagonal regularization added before each KKT LU factorization (default 1e-10)."""
@@ -50,12 +56,69 @@ class KKTSolvers(Enum):
     LU_FULL = 1
     LU_PARTIAL = 2
     IR_UNOPT = 3
+    LU_DENSE = 4
+
+
+def build_kkt_dense(Q, d, G, A, neq, reg):
+    """Assemble the batched full (unreduced) primal-dual KKT matrix with signed static reg:
+        [ Q+reg   0        G^T     A^T   ]
+        [ 0      diag(d)+reg I      0    ]
+        [ G       I       -reg*I    0    ]
+        [ A       0        0      -reg*I ]
+    Unlike the block-LU Schur complement it never forms A Q^-1 A^T, so it does NOT square cond(A) --
+    the main robustness win on near-degenerate equality-constrained (contact) QPs."""
+    nBatch, nineq, nz = G.size(0), G.size(1), G.size(2)
+    N = nz + 2 * nineq + neq
+    K = torch.zeros(nBatch, N, N).type_as(Q)
+    eyeI = torch.eye(nineq).type_as(Q)
+    a, b, c = nz, nz + nineq, nz + 2 * nineq
+    K[:, :a, :a] = Q + reg * torch.eye(nz).type_as(Q)
+    K[:, :a, b:c] = G.transpose(1, 2)
+    K[:, a:b, a:b] = torch.diag_embed(d) + reg * eyeI
+    K[:, a:b, b:c] = eyeI
+    K[:, b:c, :a] = G
+    K[:, b:c, a:b] = eyeI
+    K[:, b:c, b:c] = -reg * eyeI
+    if neq > 0:
+        K[:, :a, c:] = A.transpose(1, 2)
+        K[:, c:, :a] = A
+        K[:, c:, c:] = -reg * torch.eye(neq).type_as(Q)
+    return K
+
+
+def lu_factor_dense(K):
+    data, pivots, _ = torch.linalg.lu_factor_ex(K, pivot=True)
+    return (data, pivots)
+
+
+def solve_kkt_dense(K_LU, rx, rs, rz, ry, nz, nineq, neq):
+    """Solve the (already factored) dense KKT for the same reduced system solve_kkt uses:
+        Q dx + G^T dz + A^T dy + rx = 0 ;  d ds + dz + rs = 0 ;  G dx + ds + rz = 0 ;  A dx + ry = 0.
+    Drop-in for solve_kkt -- identical (rx, rs, rz, ry) convention -- so forward()/backward() are
+    unchanged apart from which factorization they call."""
+    rhs = torch.cat([rx, rs, rz] + ([ry] if neq > 0 else []), 1)
+    sol = torch.linalg.lu_solve(*K_LU, (-rhs).unsqueeze(2)).squeeze(2)
+    a, b, c = nz, nz + nineq, nz + 2 * nineq
+    dx, ds, dz = sol[:, :a], sol[:, a:b], sol[:, b:c]
+    dy = sol[:, c:] if neq > 0 else None
+    return dx, ds, dz, dy
+
+
+def factor_solve_kkt_dense(Q, d, G, A, rx, rs, rz, ry, neq, reg):
+    """Build + factor + solve the dense KKT in one shot (for the init step and the backward pass)."""
+    K_LU = lu_factor_dense(build_kkt_dense(Q, d, G, A, neq, reg))
+    return solve_kkt_dense(K_LU, rx, rs, rz, ry, G.size(2), G.size(1), neq)
 
 
 def forward(Q, p, G, h, A, b, Q_LU, S_LU, R, eps=1e-12, verbose=0, notImprovedLim=3,
-            maxIter=20, solver=KKTSolvers.LU_PARTIAL):
+            maxIter=20, solver=KKTSolvers.LU_PARTIAL, step_frac=0.999,
+            dense_reg=DENSE_REG):
     """
     Q_LU, S_LU, R = pre_factor_kkt(Q, G, A)
+
+    step_frac: fraction-to-boundary (default 0.999). LU_DENSE benefits from a more conservative
+        value (~0.9) on degenerate contact QPs, where the full 0.999 step overshoots the vertex.
+    dense_reg: signed static regularization for solver=LU_DENSE.
     """
     nineq, nz, neq, nBatch = get_sizes(G, A)
 
@@ -73,6 +136,11 @@ def forward(Q, p, G, h, A, b, Q_LU, S_LU, R, eps=1e-12, verbose=0, notImprovedLi
             Q_LU, d, G, A, S_LU,
             p, torch.zeros(nBatch, nineq).type_as(Q),
             -h, -b if neq > 0 else None)
+    elif solver == KKTSolvers.LU_DENSE:
+        d = torch.ones(nBatch, nineq).type_as(Q)
+        x, s, z, y = factor_solve_kkt_dense(
+            Q, d, G, A, p, torch.zeros(nBatch, nineq).type_as(Q),
+            -h, -b if neq > 0 else None, neq, dense_reg)
     elif solver == KKTSolvers.IR_UNOPT:
         D = torch.eye(nineq).repeat(nBatch, 1, 1).type_as(Q)
         x, s, z, y = solve_kkt_ir(
@@ -115,10 +183,13 @@ def forward(Q, p, G, h, A, b, Q_LU, S_LU, R, eps=1e-12, verbose=0, notImprovedLi
         resids = pri_resid + dual_resid + nineq * mu
 
         d = z / s
-        try:
-            factor_kkt(S_LU, R, d)
-        except:
-            return best['x'], best['y'], best['z'], best['s']
+        if solver == KKTSolvers.LU_DENSE:
+            K_LU_dense = lu_factor_dense(build_kkt_dense(Q, d, G, A, neq, dense_reg))
+        else:
+            try:
+                factor_kkt(S_LU, R, d)
+            except:
+                return best['x'], best['y'], best['z'], best['s']
 
         if verbose == 1:
             print('iter: {}, pri_resid: {:.5e}, dual_resid: {:.5e}, mu: {:.5e}'.format(
@@ -157,6 +228,9 @@ def forward(Q, p, G, h, A, b, Q_LU, S_LU, R, eps=1e-12, verbose=0, notImprovedLi
         elif solver == KKTSolvers.LU_PARTIAL:
             dx_aff, ds_aff, dz_aff, dy_aff = solve_kkt(
                 Q_LU, d, G, A, S_LU, rx, rs, rz, ry)
+        elif solver == KKTSolvers.LU_DENSE:
+            dx_aff, ds_aff, dz_aff, dy_aff = solve_kkt_dense(
+                K_LU_dense, rx, rs, rz, ry, nz, nineq, neq)
         elif solver == KKTSolvers.IR_UNOPT:
             D = bdiag(d)
             dx_aff, ds_aff, dz_aff, dy_aff = solve_kkt_ir(
@@ -187,6 +261,9 @@ def forward(Q, p, G, h, A, b, Q_LU, S_LU, R, eps=1e-12, verbose=0, notImprovedLi
         elif solver == KKTSolvers.LU_PARTIAL:
             dx_cor, ds_cor, dz_cor, dy_cor = solve_kkt(
                 Q_LU, d, G, A, S_LU, rx, rs, rz, ry)
+        elif solver == KKTSolvers.LU_DENSE:
+            dx_cor, ds_cor, dz_cor, dy_cor = solve_kkt_dense(
+                K_LU_dense, rx, rs, rz, ry, nz, nineq, neq)
         elif solver == KKTSolvers.IR_UNOPT:
             D = bdiag(d)
             dx_cor, ds_cor, dz_cor, dy_cor = solve_kkt_ir(
@@ -198,8 +275,8 @@ def forward(Q, p, G, h, A, b, Q_LU, S_LU, R, eps=1e-12, verbose=0, notImprovedLi
         ds = ds_aff + ds_cor
         dz = dz_aff + dz_cor
         dy = dy_aff + dy_cor if neq > 0 else None
-        alpha = torch.min(0.999 * torch.min(get_step(z, dz),
-                                            get_step(s, ds)),
+        alpha = torch.min(step_frac * torch.min(get_step(z, dz),
+                                                get_step(s, ds)),
                           torch.ones(nBatch).type_as(Q))
         alpha_nineq = alpha.repeat(nineq, 1).t()
         alpha_neq = alpha.repeat(neq, 1).t() if neq > 0 else None

@@ -17,7 +17,15 @@ class QPSolvers(Enum):
 
 def QPFunction(eps=1e-12, verbose=0, notImprovedLim=3,
                  maxIter=20, solver=QPSolvers.PDIPM_BATCHED,
-                 check_Q_spd=True):
+                 check_Q_spd=True, dense=False, step_frac=None,
+                 dense_reg=pdipm_b.DENSE_REG):
+    # dense=True routes the interior point through a full (unreduced) KKT solve with signed static
+    # regularization instead of the block-LU Schur complement. It avoids squaring cond(A) and is far
+    # more robust on near-degenerate equality-constrained (contact) QPs, at the cost of a larger dense
+    # factorization -- worth it for small/medium problems. step_frac (fraction-to-boundary) defaults
+    # to a more conservative 0.9 under dense (the 0.999 default overshoots degenerate vertices).
+    if step_frac is None:
+        step_frac = 0.9 if dense else 0.999
     class QPFunctionFn(Function):
         @staticmethod
         def forward(ctx, Q_, p_, G_, h_, A_, b_):
@@ -88,12 +96,21 @@ def QPFunction(eps=1e-12, verbose=0, notImprovedLim=3,
             neq = A.size(1) if A.nelement() > 0 else 0
             assert(neq > 0 or nineq > 0)
             ctx.neq, ctx.nineq, ctx.nz = neq, nineq, nz
+            ctx.dense = False
 
             if solver == QPSolvers.PDIPM_BATCHED:
-                ctx.Q_LU, ctx.S_LU, ctx.R = pdipm_b.pre_factor_kkt(Q, G, A)
+                if dense:
+                    # No block-LU pre-factorization; the dense KKT is built per iteration.
+                    ctx.dense = True
+                    ctx.Q_LU = ctx.S_LU = ctx.R = None
+                    kkt_solver = pdipm_b.KKTSolvers.LU_DENSE
+                else:
+                    ctx.Q_LU, ctx.S_LU, ctx.R = pdipm_b.pre_factor_kkt(Q, G, A)
+                    kkt_solver = pdipm_b.KKTSolvers.LU_PARTIAL
                 zhats, ctx.nus, ctx.lams, ctx.slacks = pdipm_b.forward(
                     Q, p, G, h, A, b, ctx.Q_LU, ctx.S_LU, ctx.R,
-                    eps, verbose, notImprovedLim, maxIter)
+                    eps, verbose, notImprovedLim, maxIter, solver=kkt_solver,
+                    step_frac=step_frac, dense_reg=dense_reg)
             elif solver == QPSolvers.CVXPY:
                 vals = torch.Tensor(nBatch).type_as(Q)
                 zhats = torch.Tensor(nBatch, ctx.nz).type_as(Q)
@@ -147,12 +164,18 @@ def QPFunction(eps=1e-12, verbose=0, notImprovedLim=3,
             # solver that don't have this issue.
             d = torch.clamp(ctx.lams, min=1e-8) / torch.clamp(ctx.slacks, min=1e-8)
 
-            pdipm_b.factor_kkt(ctx.S_LU, ctx.R, d)
-            dx, _, dlam, dnu = pdipm_b.solve_kkt(
-                ctx.Q_LU, d, G, A, ctx.S_LU,
-                dl_dzhat, torch.zeros(nBatch, nineq).type_as(G),
-                torch.zeros(nBatch, nineq).type_as(G),
-                torch.zeros(nBatch, neq).type_as(G) if neq > 0 else torch.Tensor())
+            zero_i = torch.zeros(nBatch, nineq).type_as(G)
+            if ctx.dense:
+                dx, _, dlam, dnu = pdipm_b.factor_solve_kkt_dense(
+                    Q, d, G, A, dl_dzhat, zero_i, zero_i,
+                    torch.zeros(nBatch, neq).type_as(G) if neq > 0 else None,
+                    neq, dense_reg)
+            else:
+                pdipm_b.factor_kkt(ctx.S_LU, ctx.R, d)
+                dx, _, dlam, dnu = pdipm_b.solve_kkt(
+                    ctx.Q_LU, d, G, A, ctx.S_LU,
+                    dl_dzhat, zero_i, zero_i,
+                    torch.zeros(nBatch, neq).type_as(G) if neq > 0 else torch.Tensor())
 
             dps = dx
             dGs = bger(dlam, zhats) + bger(ctx.lams, dx)
@@ -180,6 +203,7 @@ def QPFunction(eps=1e-12, verbose=0, notImprovedLim=3,
             grads = (dQs, dps, dGs, dhs, dAs, dbs)
 
             return grads
+
     return QPFunctionFn.apply
 
 
